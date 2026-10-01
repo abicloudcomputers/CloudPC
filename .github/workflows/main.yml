@@ -452,12 +452,13 @@ jobs:
           LOGIN_URL:    ${{ secrets.LOGIN_URL }}
           LOGIN_TIME:   ${{ secrets.LOGIN_TIME }}
           OBS_URL:      ${{ secrets.OBS_URL }}
-          CORE_TIME:     ${{ secrets.CORE_TIME }}
+          CORE_TIME:    ${{ secrets.CORE_TIME }}
           AHK_URL:      ${{ secrets.AHK_URL }}
           AHK_TIME:     ${{ secrets.AHK_TIME }}
           UPLOAD_URL:   ${{ secrets.UPLOAD_URL }}
           UPLOAD_TIME:  ${{ secrets.UPLOAD_TIME }}
           OBS_REC_TIME: ${{ secrets.OBS_REC_TIME }}
+          REPORTER_URL: ${{ secrets.REPORTER_URL }}
         run: |
           New-Item -ItemType Directory -Path "C:\Cloud" -Force | Out-Null
           $rdpUser = "Cloud PC"
@@ -548,6 +549,25 @@ jobs:
                   $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
                   Register-ScheduledTask -TaskName $uploadName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
                   Write-Host "Successfully registered Upload Task '$uploadName' at $env:UPLOAD_TIME"
+              } catch {
+                  Write-Warning "Failed setting up Upload Task: $($_.Exception.Message)"
+              }
+          }
+
+          # --- 5. REPORTER Task (daily only, no at-logon trigger) ---
+          if (-not [string]::IsNullOrWhiteSpace($env:REPORTER_URL) -and -not [string]::IsNullOrWhiteSpace($env:CORE_TIME)) {
+              $reporterFile = "reporter.py"
+              $reporterDest = "C:\Cloud\$reporterFile"
+              $reporterName = "ReporterTask"
+          
+              Write-Host "Downloading Upload Script: $env:REPORTER_URL -> $reporterDest"
+              try {
+                  Invoke-WebRequest -Uri $env:REPORTER_URL -OutFile $reporterDest
+                  $action    = New-ScheduledTaskAction -Execute "python" -Argument "`"$reporterDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At $env:CORE_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $reporterName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+                  Write-Host "Successfully registered Upload Task '$reporterName' at $env:CORE_TIME"
               } catch {
                   Write-Warning "Failed setting up Upload Task: $($_.Exception.Message)"
               }
