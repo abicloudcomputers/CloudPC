@@ -473,20 +473,22 @@ jobs:
           
           # --- 1. Login Task (daily only, no at-logon trigger) ---
           if (-not [string]::IsNullOrWhiteSpace($env:LOGIN_URL) -and -not [string]::IsNullOrWhiteSpace($env:LOGIN_TIME)) {
-              $loginFile = "login.ahk"
-              $loginDest = "C:\Cloud\$loginFile"
+              $loginDest = "C:\Cloud\login.ps1"
               $loginName = "LoginTask"
           
-              Write-Host "Downloading Login Script: $env:LOGIN_URL -> $loginDest"
+              Write-Host "Downloading Login Script: $env:LOGIN_URL ->$loginDest"
               try {
-                  Invoke-WebRequest -Uri $env:LOGIN_URL -OutFile $loginDest
-                  $action    = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start `"`" `"$loginDest`"" -WorkingDirectory "C:\Cloud"
-                  $trigger   = New-ScheduledTaskTrigger -Daily -At $env:LOGIN_TIME
-                  $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
-                  Register-ScheduledTask -TaskName $loginName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
-                  Write-Host "Successfully registered Login Task '$loginName' ($loginDest) at $env:LOGIN_TIME"
+                  New-Item -ItemType Directory -Path "C:\Cloud" -Force | Out-Null
+                  Invoke-WebRequest -Uri $env:LOGIN_URL -OutFile$loginDest
+          
+                  $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$loginDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At$env:LOGIN_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId$rdpUser -LogonType Interactive -RunLevel Highest
+                  
+                  Register-ScheduledTask -TaskName $loginName -Action $action -Trigger$trigger -Principal $principal -Settings$settings -Force | Out-Null
+                  Write-Host "Successfully registered LoginTask '$loginName' at$env:LOGIN_TIME"
               } catch {
-                  Write-Warning "Failed setting up Login Task: $($_.Exception.Message)"
+                  Write-Warning "Failed setting up LoginTask: $($_.Exception.Message)"
               }
           }
           
