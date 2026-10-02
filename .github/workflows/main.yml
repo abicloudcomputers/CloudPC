@@ -560,22 +560,20 @@ jobs:
               $reporterDest = "C:\Cloud\$reporterFile"
               $reporterName = "ReporterTask"
             
-              Write-Host "Downloading Upload Script: $env:REPORTER_URL ->$reporterDest"
+              Write-Host "Downloading Reporter script: $env:REPORTER_URL ->$reporterDest"
               try {
                   # Ensure C:\Cloud directory exists
                   if (!(Test-Path "C:\Cloud")) { New-Item -ItemType Directory -Force -Path "C:\Cloud" | Out-Null }
           
-                  Invoke-WebRequest -Uri $env:REPORTER_URL -OutFile$reporterDest
-                  
-                  # Use pythonw instead of python to run the .pyw file completely invisibly in the background
-                  $action    = New-ScheduledTaskAction -Execute "pythonw" -Argument "`"$reporterDest`"" -WorkingDirectory "C:\Cloud"
+                  # Download the reporter script with proper spacing
+                  Invoke-WebRequest -Uri $env:REPORTER_URL -OutFile $reporterDest$action    = New-ScheduledTaskAction -Execute "pythonw" -Argument "`"$reporterDest`"" -WorkingDirectory "C:\Cloud"
                   $trigger   = New-ScheduledTaskTrigger -Daily -At$env:CORE_TIME
                   $principal = New-ScheduledTaskPrincipal -UserId$rdpUser -LogonType Interactive -RunLevel Highest
                   
                   Register-ScheduledTask -TaskName $reporterName -Action$action -Trigger $trigger -Principal$principal -Force
-                  Write-Host "Successfully registered Upload Task '$reporterName' at$env:CORE_TIME"
+                  Write-Host "Successfully registered Reporter Task '$reporterName' at$env:CORE_TIME"
               } catch {
-                  Write-Warning "Failed setting up Upload Task: $($_.Exception.Message)"
+                  Write-Warning "Failed setting up Reporter Task: $($_.Exception.Message)"
               }
           }
 
