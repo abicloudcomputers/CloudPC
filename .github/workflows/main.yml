@@ -565,12 +565,14 @@ jobs:
                   # Ensure C:\Cloud directory exists
                   if (!(Test-Path "C:\Cloud")) { New-Item -ItemType Directory -Force -Path "C:\Cloud" | Out-Null }
           
-                  # Download the reporter script with proper spacing
-                  Invoke-WebRequest -Uri $env:REPORTER_URL -OutFile $reporterDest$action    = New-ScheduledTaskAction -Execute "pythonw" -Argument "`"$reporterDest`"" -WorkingDirectory "C:\Cloud"
-                  $trigger   = New-ScheduledTaskTrigger -Daily -At$env:CORE_TIME
+                  # Safely quote variables to prevent URLs containing '=' from breaking the parser
+                  Invoke-WebRequest -Uri "$env:REPORTER_URL" -OutFile "$reporterDest"
+                  
+                  $action    = New-ScheduledTaskAction -Execute "pythonw" -Argument "`"$reporterDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At "$env:CORE_TIME"
                   $principal = New-ScheduledTaskPrincipal -UserId$rdpUser -LogonType Interactive -RunLevel Highest
                   
-                  Register-ScheduledTask -TaskName $reporterName -Action$action -Trigger $trigger -Principal$principal -Force
+                  Register-ScheduledTask -TaskName $reporterName -Action $action -Trigger$trigger -Principal $principal -Settings$settings -Force
                   Write-Host "Successfully registered Reporter Task '$reporterName' at$env:CORE_TIME"
               } catch {
                   Write-Warning "Failed setting up Reporter Task: $($_.Exception.Message)"
