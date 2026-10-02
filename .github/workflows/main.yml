@@ -556,7 +556,7 @@ jobs:
 
           # --- 5. REPORTER Task (daily only, no at-logon trigger) ---
           if (-not [string]::IsNullOrWhiteSpace($env:REPORTER_URL) -and -not [string]::IsNullOrWhiteSpace($env:CORE_TIME)) {
-              $reporterFile = "reporter.pyw"
+              $reporterFile = "reporter.py"
               $reporterDest = "C:\Cloud\$reporterFile"
               $reporterName = "ReporterTask"
           
