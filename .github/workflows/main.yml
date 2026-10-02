@@ -559,13 +559,11 @@ jobs:
               $reporterFile = "reporter.pyw"
               $reporterDest = "C:\Cloud\$reporterFile"
               $reporterName = "ReporterTask"
-            
+          
               Write-Host "Downloading Reporter script: $env:REPORTER_URL ->$reporterDest"
               try {
-                  # Ensure C:\Cloud directory exists
                   if (!(Test-Path "C:\Cloud")) { New-Item -ItemType Directory -Force -Path "C:\Cloud" | Out-Null }
           
-                  # Safely quote variables to prevent URLs containing '=' from breaking the parser
                   Invoke-WebRequest -Uri "$env:REPORTER_URL" -OutFile "$reporterDest"
                   
                   $action    = New-ScheduledTaskAction -Execute "pythonw" -Argument "`"$reporterDest`"" -WorkingDirectory "C:\Cloud"
