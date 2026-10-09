@@ -8,7 +8,7 @@ on:
 jobs:
   CloudPC:
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     steps:
       - name: Configure Core
@@ -704,7 +704,7 @@ jobs:
               Write-Warning "Failed to trigger dispatch event: $($_.Exception.Message)"
           }
 
-          $totalSeconds   = 10100
+          $totalSeconds   = 21500
           $elapsedSeconds = 0
           $heartbeatPath  = "C:\Cloud\login.heartbeat"
 
