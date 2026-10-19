@@ -8,7 +8,7 @@ on:
 jobs:
   CloudPC:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 180
 
     steps:
       - name: Configure Core
@@ -221,6 +221,357 @@ jobs:
 
           Start-Sleep -Seconds 3
 
+      - name: Install Software
+        run: |
+          winget source update
+          winget install --id OBSProject.OBSStudio   --exact --source winget --accept-source-agreements --accept-package-agreements
+          winget install --id Zoom.Zoom              -e      --source winget --accept-source-agreements --accept-package-agreements
+          winget install --id AutoHotkey.AutoHotkey  --exact --source winget --accept-source-agreements --accept-package-agreements
+
+          python -m pip install --upgrade pip
+          pip install requests requests-toolbelt Pillow tqdm
+
+      - name: Download & Configure OBS Scenes & Profiles
+        shell: pwsh
+        env:
+          OBS_JSON_URL: ${{ secrets.OBS_JSON_URL }}
+          CORE_TIME:     ${{ secrets.CORE_TIME }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $rdpUser = "Cloud PC"
+          $url = if (-not [string]::IsNullOrWhiteSpace($env:OBS_JSON_URL)) { $env:OBS_JSON_URL } else { "***" }
+
+          Write-Host "Fetching OBS configuration from: $url"
+          $data = (Invoke-WebRequest -Uri $url).Content | ConvertFrom-Json
+
+          $stageRoot    = "C:\Cloud\obs-stage"
+          $stageScenes  = Join-Path $stageRoot "scenes"
+          $stageProfile = Join-Path $stageRoot "profile"
+
+          if (Test-Path $stageRoot) { Remove-Item $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $stageScenes  | Out-Null
+          New-Item -ItemType Directory -Force -Path $stageProfile | Out-Null
+
+          foreach ($fileUrl in $data.scenes) {
+              $fileName = Split-Path ([uri]$fileUrl).AbsolutePath -Leaf
+              Write-Host "Staging scene:   $fileName"
+              Invoke-WebRequest -Uri $fileUrl -OutFile (Join-Path -Path $stageScenes -ChildPath $fileName)
+          }
+
+          foreach ($fileUrl in $data.profiles) {
+              $fileName = Split-Path ([uri]$fileUrl).AbsolutePath -Leaf
+              Write-Host "Staging profile: $fileName"
+              Invoke-WebRequest -Uri $fileUrl -OutFile (Join-Path -Path $stageProfile -ChildPath $fileName)
+          }
+
+          $moverScript = @'
+          $ErrorActionPreference = 'Continue'
+
+          $stageRoot    = "C:\Cloud\obs-stage"
+          $stageScenes  = Join-Path $stageRoot "scenes"
+          $stageProfile = Join-Path $stageRoot "profile"
+          
+          $apps = @(
+              @{
+                  Name = "OBS Studio"
+                  Id   = "OBSProject.OBSStudio"
+              },
+              @{
+                  Name = "Zoom"
+                  Id   = "Zoom.Zoom"
+              },
+              @{
+                  Name = "AutoHotkey"
+                  Id   = "AutoHotkey.AutoHotkey"
+              }
+          )
+          
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+              Write-Host "ERROR: winget is not available." -ForegroundColor Red
+              exit 1
+          }
+          
+          foreach ($app in $apps) {
+          
+              Write-Host "Checking $($app.Name)..." -ForegroundColor Cyan
+          
+              $installed = winget list `
+                  --id $app.Id `
+                  --exact `
+                  --source winget `
+                  --accept-source-agreements `
+                  2>$null
+          
+              if ($LASTEXITCODE -eq 0 -and $installed -match [regex]::Escape($app.Id)) {
+                  Write-Host "$($app.Name) is already installed." -ForegroundColor Green
+              }
+              else {
+                  Write-Host "Installing $($app.Name)..." -ForegroundColor Yellow
+          
+                  winget install `
+                      --id $app.Id `
+                      --exact `
+                      --source winget `
+                      --accept-source-agreements `
+                      --accept-package-agreements
+          
+                  if ($LASTEXITCODE -eq 0) {
+                      Write-Host "$($app.Name) installed successfully." -ForegroundColor Green
+                  }
+                  else {
+                      Write-Host "Failed to install $($app.Name)." -ForegroundColor Red
+                  }
+              }
+          }
+          
+          $candidates = @(
+              $env:USERPROFILE
+              "C:\Users\Cloud PC.runnervmvmocb"
+              "C:\Users\Cloud PC"
+          ) | Where-Object {
+              $_ -and (Test-Path $_)
+          } | Select-Object -Unique
+          
+          if (-not $candidates) {
+              Write-Host "No user profile found." -ForegroundColor Yellow
+              exit 0
+          }
+          
+          $profilePath = $candidates | Select-Object -First 1
+          
+          $destScenes = Join-Path $profilePath "AppData\Roaming\obs-studio\basic\scenes"
+          $destProfile = Join-Path $profilePath "AppData\Roaming\obs-studio\basic\profiles\Untitled"
+          
+          if (-not (Test-Path $destScenes)) {
+              New-Item -ItemType Directory -Path $destScenes -Force | Out-Null
+          }
+          
+          if (-not (Test-Path $destProfile)) {
+              New-Item -ItemType Directory -Path $destProfile -Force | Out-Null
+          }
+          
+          if (Test-Path $stageScenes) {
+              Get-ChildItem -Path $stageScenes -File -ErrorAction SilentlyContinue | ForEach-Object {
+                  Move-Item `
+                      -Path $_.FullName `
+                      -Destination (Join-Path $destScenes $_.Name) `
+                      -Force `
+                      -ErrorAction SilentlyContinue
+              }
+          }
+          
+          if (Test-Path $stageProfile) {
+              Get-ChildItem -Path $stageProfile -File -ErrorAction SilentlyContinue | ForEach-Object {
+                  Move-Item `
+                      -Path $_.FullName `
+                      -Destination (Join-Path $destProfile $_.Name) `
+                      -Force `
+                      -ErrorAction SilentlyContinue
+              }
+          }
+          
+          New-Item -Path "HKCU:\SOFTWARE\Policies\Zoom\Zoom Meetings\Meetings" -Force | Out-Null
+          New-ItemProperty `
+              -Path "HKCU:\SOFTWARE\Policies\Zoom\Zoom Meetings\Meetings" `
+              -Name "EnterFullScreenWhenJoinMeeting" `
+              -PropertyType DWord `
+              -Value 1 `
+              -Force | Out-Null
+          
+          Write-Host "Zoom full-screen-on-join policy configured." -ForegroundColor Green
+          Write-Host "Completed." -ForegroundColor Green
+          '@
+
+          $moverPath = "C:\Cloud\obs-mover.ps1"
+          New-Item -ItemType Directory -Path "C:\Cloud" -Force | Out-Null
+          $moverScript | Out-File -FilePath $moverPath -Encoding utf8 -Force
+          
+          $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+          
+          if (-not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+              Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+              exit
+          }
+          
+          & "$env:SystemRoot\System32\schtasks.exe" /delete /tn "OBSMover" /f 2>$null | Out-Null
+          $global:LASTEXITCODE = 0
+          
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+              -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$moverPath`"" `
+              -WorkingDirectory "C:\Cloud"
+          
+          $trigger = New-ScheduledTaskTrigger -Daily -At $env:CORE_TIME
+          
+          $principal = New-ScheduledTaskPrincipal `
+              -UserId $rdpUser `
+              -LogonType Interactive `
+              -RunLevel Highest
+          
+          $settings = New-ScheduledTaskSettingsSet `
+              -AllowStartIfOnBatteries `
+              -DontStopIfGoingOnBatteries `
+              -StartWhenAvailable `
+              -RestartCount 999 `
+              -RestartInterval (New-TimeSpan -Minutes 1) `
+              -ExecutionTimeLimit (New-TimeSpan -Hours 0)
+          
+          Register-ScheduledTask `
+              -TaskName "OBSMover" `
+              -Action $action `
+              -Trigger $trigger `
+              -Principal $principal `
+              -Settings $settings `
+              -Force | Out-Null
+          
+          Write-Host "Successfully registered OBSMover task at $env:CORE_TIME (daily)."
+          
+          $task = Get-ScheduledTask -TaskName "OBSMover" -ErrorAction SilentlyContinue
+          
+          if ($task) {
+              Write-Host "  Name     : $($task.TaskName)"
+              Write-Host "  State    : $($task.State)"
+              Write-Host "  Principal: $($task.Principal.UserId) ($($task.Principal.LogonType))"
+              Write-Host "  RunLevel : $($task.Principal.RunLevel)"
+              $task.Triggers | ForEach-Object {
+                  Write-Host "  Trigger  : $($_.CimClass.CimClassName) @ $($_.StartBoundary)"
+              }
+          } else {
+              Write-Host "::error::Task 'OBSMover' was NOT registered."
+              exit 1
+          }
+          
+          Write-Host "OBS config staged at: $stageRoot"
+          Write-Host "OBSMover will move files daily at $env:CORE_TIME."
+          
+          $global:LASTEXITCODE = 0
+          exit 0
+          
+      - name: Configure Cloud Directory & Auto Tasks
+        env:
+          LOGIN_URL:    ${{ secrets.LOGIN_URL }}
+          LOGIN_TIME:   ${{ secrets.LOGIN_TIME }}
+          OBS_URL:      ${{ secrets.OBS_URL }}
+          CORE_TIME:    ${{ secrets.CORE_TIME }}
+          AHK_URL:      ${{ secrets.AHK_URL }}
+          AHK_TIME:     ${{ secrets.AHK_TIME }}
+          UPLOAD_URL:   ${{ secrets.UPLOAD_URL }}
+          UPLOAD_TIME:  ${{ secrets.UPLOAD_TIME }}
+          OBS_REC_TIME: ${{ secrets.OBS_REC_TIME }}
+          REPORTER_URL: ${{ secrets.REPORTER_URL }}
+        run: |
+          New-Item -ItemType Directory -Path "C:\Cloud" -Force | Out-Null
+          $rdpUser = "Cloud PC"
+
+          $settings = New-ScheduledTaskSettingsSet `
+              -AllowStartIfOnBatteries `
+              -DontStopIfGoingOnBatteries `
+              -StartWhenAvailable `
+              -RestartCount 999 `
+              -RestartInterval (New-TimeSpan -Minutes 1) `
+              -ExecutionTimeLimit (New-TimeSpan -Hours 0)
+          
+          # --- 1. Login Task (daily only, no at-logon trigger) ---
+          if (-not [string]::IsNullOrWhiteSpace($env:LOGIN_URL) -and -not [string]::IsNullOrWhiteSpace($env:LOGIN_TIME)) {
+              $loginFile = "login.ps1"
+              $loginDest = "C:\Cloud\$loginFile"
+              $loginName = "LoginTask"
+          
+              Write-Host "Downloading Login Script: $env:LOGIN_URL -> $loginDest"
+              try {
+                  Invoke-WebRequest -Uri $env:LOGIN_URL -OutFile $loginDest
+                  $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$loginDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At $env:LOGIN_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $loginName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+                  Write-Host "Successfully registered Login Task '$loginName' at $env:LOGIN_TIME"
+              } catch {
+                  Write-Warning "Failed setting up Login Task: $($_.Exception.Message)"
+              }
+          }
+          
+          # --- 2. AHK Task (daily only, no at-logon trigger) ---
+          if (-not [string]::IsNullOrWhiteSpace($env:AHK_URL) -and -not [string]::IsNullOrWhiteSpace($env:AHK_TIME)) {
+              $ahkFile = "auto.ahk"
+              $ahkDest = "C:\Cloud\$ahkFile"
+              $ahkName = "AHKTask"
+
+              Write-Host "Downloading AHK Script: $env:AHK_URL -> $ahkDest"
+              try {
+                  Invoke-WebRequest -Uri $env:AHK_URL -OutFile $ahkDest
+                  $action    = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start `"`" `"$ahkDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At $env:AHK_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $ahkName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+                  Write-Host "Successfully registered AHK Task '$ahkName' ($ahkDest) at $env:AHK_TIME"
+              } catch {
+                  Write-Warning "Failed setting up AHK Task: $($_.Exception.Message)"
+              }
+          }
+
+          # --- 3. OBS_REC Task (daily: restart OBS and start recording) ---
+          if (-not [string]::IsNullOrWhiteSpace($env:OBS_REC_TIME)) {
+              $obsRecFile = "obs_rec.ps1"
+              $obsRecDest = "C:\Cloud\$obsRecFile"
+              $obsRecName = "OBS_REC"
+
+              $obsRecScript = @(
+                  'Stop-Process -Name "obs64" -ErrorAction SilentlyContinue'
+                  'Start-Sleep -Seconds 3'
+                  'Start-Process "C:\Program Files\obs-studio\bin\64bit\obs64.exe" -WorkingDirectory "C:\Program Files\obs-studio\bin\64bit" -ArgumentList "--collection", "Zoom", "--startrecording"'
+              ) -join "`r`n"
+
+              Write-Host "Creating OBS_REC script: $obsRecDest"
+              try {
+                  Set-Content -Path $obsRecDest -Value $obsRecScript -Encoding UTF8
+
+                  $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$obsRecDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At $env:OBS_REC_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $obsRecName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+                  Write-Host "Successfully registered OBS_REC Task '$obsRecName' at $env:OBS_REC_TIME"
+              } catch {
+                  Write-Warning "Failed setting up OBS_REC Task: $($_.Exception.Message)"
+              }
+          }
+
+          # --- 4. UPLOAD Task (daily only, no at-logon trigger) ---
+          if (-not [string]::IsNullOrWhiteSpace($env:UPLOAD_URL) -and -not [string]::IsNullOrWhiteSpace($env:UPLOAD_TIME)) {
+              $uploadFile = "upload.py"
+              $uploadDest = "C:\Cloud\$uploadFile"
+              $uploadName = "UploadTask"
+          
+              Write-Host "Downloading Upload Script: $env:UPLOAD_URL -> $uploadDest"
+              try {
+                  Invoke-WebRequest -Uri $env:UPLOAD_URL -OutFile $uploadDest
+                  $action    = New-ScheduledTaskAction -Execute "python" -Argument "`"$uploadDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At $env:UPLOAD_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $uploadName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+                  Write-Host "Successfully registered Upload Task '$uploadName' at $env:UPLOAD_TIME"
+              } catch {
+                  Write-Warning "Failed setting up Upload Task: $($_.Exception.Message)"
+              }
+          }
+
+          # --- 5. REPORTER Task (daily only, no at-logon trigger) ---
+          if (-not [string]::IsNullOrWhiteSpace($env:REPORTER_URL) -and -not [string]::IsNullOrWhiteSpace($env:CORE_TIME)) {
+              $reporterFile = "reporter.py"
+              $reporterDest = "C:\Cloud\$reporterFile"
+              $reporterName = "ReporterTask"
+          
+              Write-Host "Downloading Upload Script: $env:REPORTER_URL -> $reporterDest"
+              try {
+                  Invoke-WebRequest -Uri $env:REPORTER_URL -OutFile $reporterDest
+                  $action    = New-ScheduledTaskAction -Execute "python" -Argument "`"$reporterDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger   = New-ScheduledTaskTrigger -Daily -At $env:CORE_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId $rdpUser -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $reporterName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+                  Write-Host "Successfully registered Reporter Task '$reporterName' at $env:CORE_TIME"
+              } catch {
+                  Write-Warning "Failed setting up Reporter Task: $($_.Exception.Message)"
+              }
+          }
 
       - name: Configure Direct Console Auto-Loop
         run: |
