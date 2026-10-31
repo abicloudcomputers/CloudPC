@@ -22,119 +22,15 @@ jobs:
 
     steps:
       - name: Add Tailscale Repository & Install Dependencies
-        timeout-minutes: 30
         run: |
-          set -uo pipefail
-
-          apt_get() {
-            local cap="$1"; shift
-            sudo timeout --kill-after=20s "${cap}s" apt-get "$@" \
-              -o Acquire::Retries=3 \
-              -o Acquire::http::Timeout=30 \
-              -o Acquire::https::Timeout=30 \
-              -o Acquire::ForceIPv4=true \
-              -o Dpkg::Options::=--force-confdef \
-              -o Dpkg::Options::=--force-confold
-          }
-
-          recover_apt() {
-            echo "::warning::apt/dpkg stuck - killing and cleaning up"
-            sudo pkill -9 -f 'apt-get|dpkg|unattended-upgr' 2>/dev/null || true
-            sleep 2
-            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
-                       /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
-            sudo dpkg --configure -a >/dev/null 2>&1 || true
-            sudo timeout 120s apt-get -f install -y --no-install-recommends >/dev/null 2>&1 || true
-            sleep 5
-          }
-
           # 1. Add Tailscale GPG Key & Repo
-          repo_ok=0
-          for i in 1 2 3; do
-            if curl -fsSL --retry 3 --retry-delay 2 --max-time 60 \
-                 https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
-                 | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null \
-               && curl -fsSL --retry 3 --retry-delay 2 --max-time 60 \
-                 https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
-                 | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null ; then
-              repo_ok=1; break
-            fi
-            echo "::warning::Repo setup attempt $i failed"
-            sleep 5
-          done
-          if [ "$repo_ok" -ne 1 ]; then
-            echo "::error::Failed to add Tailscale repo after 3 attempts"
-            exit 1
-          fi
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
 
-          # 2. apt-get update with kill + retry
-          update_ok=0
-          for i in 1 2 3 4 5; do
-            echo "--- apt-get update attempt $i/5"
-            if apt_get 300 update; then update_ok=1; break; fi
-            recover_apt
-          done
-          if [ "$update_ok" -ne 1 ]; then
-            echo "::error::apt-get update failed after 5 attempts"
-            exit 1
-          fi
-
-          # 3. Pick an available FreeRDP package (freerdp2-x11 no longer exists on newer runners)
-          RDP_PKG=""
-          for pkg in freerdp3-x11 freerdp2-x11 freerdp-x11; do
-            if apt-cache pkgnames "$pkg" 2>/dev/null | grep -qx "$pkg"; then
-              RDP_PKG="$pkg"; break
-            fi
-          done
-          if [ -z "$RDP_PKG" ]; then
-            echo "::error::No FreeRDP X11 package available"
-            apt-cache search freerdp || true
-            exit 1
-          fi
-          echo "Using FreeRDP package: $RDP_PKG"
-
-          # 4. Install core packages with kill + retry
-          core_ok=0
-          for i in 1 2 3 4 5; do
-            echo "--- core install attempt $i/5"
-            if apt_get 480 install -y --no-install-recommends \
-                 "$RDP_PKG" tailscale xvfb ; then
-              core_ok=1; break
-            fi
-            recover_apt
-          done
-          if [ "$core_ok" -ne 1 ]; then
-            echo "::error::Core package install failed after 5 attempts"
-            exit 1
-          fi
-
-          # 5. Optional audio (best effort)
-          audio_ok=0
-          for i in 1 2 3; do
-            if apt_get 480 install -y --no-install-recommends \
-                 pulseaudio alsa-utils libasound2-plugins ; then
-              audio_ok=1; break
-            fi
-            recover_apt
-          done
-          [ "$audio_ok" -eq 1 ] || echo "::warning::Audio stack unavailable - continuing without sound"
-
-          # 6. Ensure an 'xfreerdp' command exists even if only xfreerdp3/xfreerdp2 is shipped
-          if ! command -v xfreerdp >/dev/null 2>&1; then
-            if command -v xfreerdp3 >/dev/null 2>&1; then
-              sudo ln -sf "$(command -v xfreerdp3)" /usr/local/bin/xfreerdp
-              echo "::notice::Linked xfreerdp3 -> xfreerdp"
-            elif command -v xfreerdp2 >/dev/null 2>&1; then
-              sudo ln -sf "$(command -v xfreerdp2)" /usr/local/bin/xfreerdp
-              echo "::notice::Linked xfreerdp2 -> xfreerdp"
-            else
-              echo "::error::No xfreerdp binary after install"
-              dpkg -L "$RDP_PKG" || true
-              exit 1
-            fi
-          fi
-          xfreerdp /version || true
-
+          # 2. Install Tailscale, Xvfb, FreeRDP, and PulseAudio dependencies
+          sudo apt-get update
+          sudo apt-get install -y tailscale xvfb freerdp2-x11 pulseaudio alsa-utils libasound2-plugins
+          
       - name: Authenticate Tailscale
         run: |
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
@@ -199,14 +95,3 @@ jobs:
           done
 
           echo "RDP connection closed or overridden. Terminating action cleanly."
-
-      - name: Diagnostics on failure
-        if: failure()
-        run: |
-          echo "::group::Tailscale status";  sudo tailscale status || true;        echo "::endgroup::"
-          echo "::group::Processes"
-          ps -eo pid,etime,cmd | grep -Ei 'xfreerdp|Xvfb|pulseaudio|tailscale' | grep -v grep || true
-          echo "::endgroup::"
-          echo "::group::FreeRDP packages";  dpkg -l | grep -i freerdp || true;     echo "::endgroup::"
-          echo "::group::apt history";       tail -n 40 /var/log/apt/history.log 2>/dev/null || true; echo "::endgroup::"
-          echo "::group::Disk";              df -h;                                echo "::endgroup::"
