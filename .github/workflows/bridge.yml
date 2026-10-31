@@ -29,11 +29,10 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
       TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      APT_UPDATE_TIMEOUT: 300     
-      APT_INSTALL_TIMEOUT: 480    
+      APT_UPDATE_TIMEOUT: 300
+      APT_INSTALL_TIMEOUT: 480
       APT_MAX_ATTEMPTS: 5
-      RDP_MAX_ATTEMPTS: 8
-      RDP_CONNECT_TIMEOUT: 60     
+      RDP_CONNECT_TIMEOUT: 60
 
     steps:
       - name: Preflight validation
@@ -50,19 +49,18 @@ jobs:
 
           IP="${DISPATCH_IP:-${INPUT_IP:-}}"
           if [ -z "$IP" ]; then
-            echo "::error::No target IP supplied (client_payload.ip / inputs.ip)"; fail=1
+            echo "::error::No target IP supplied"; fail=1
           fi
 
           echo "Runner: $(lsb_release -ds 2>/dev/null || head -1 /etc/os-release)"
           [ "$fail" -eq 1 ] && exit 1
           echo "Preflight OK -> $IP"
-          
-      - name: Install dependencies (auto stop / re-run)
+
+      - name: Install dependencies
         timeout-minutes: 60
         run: |
           set -uo pipefail
 
-          # One apt-get invocation, hard-capped by `timeout` so it can never hang.
           apt_get() {
             local cap="$1"; shift
             sudo timeout --kill-after=20s "${cap}s" apt-get "$@" \
@@ -74,9 +72,8 @@ jobs:
               -o Dpkg::Options::=--force-confold
           }
 
-          # Recover from a killed / hung apt-get.
           recover_apt() {
-            echo "::warning::apt/dpkg appears stuck — killing and cleaning up before retry"
+            echo "::warning::apt/dpkg stuck - killing and cleaning up"
             sudo pkill -9 -f 'apt-get|dpkg|unattended-upgr' 2>/dev/null || true
             sleep 2
             sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
@@ -86,7 +83,6 @@ jobs:
             sleep 5
           }
 
-          echo "::group::Add Tailscale repo"
           for i in 1 2 3; do
             if curl -fsSL --retry 3 --retry-delay 2 --max-time 60 \
                  https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
@@ -96,22 +92,17 @@ jobs:
                  | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null ; then
               break
             fi
-            echo "::warning::Repo setup attempt $i failed, retrying"
+            echo "::warning::Repo setup attempt $i failed"
             sleep 5
           done
-          echo "::endgroup::"
 
-          echo "::group::apt-get update (kill + retry)"
           ok=0
           for i in $(seq 1 "$APT_MAX_ATTEMPTS"); do
-            echo "--- update attempt $i/$APT_MAX_ATTEMPTS"
             if apt_get "$APT_UPDATE_TIMEOUT" update; then ok=1; break; fi
             recover_apt
           done
-          [ "$ok" -eq 1 ] || { echo "::error::apt-get update failed after $APT_MAX_ATTEMPTS attempts"; exit 1; }
-          echo "::endgroup::"
+          [ "$ok" -eq 1 ] || { echo "::error::apt-get update failed"; exit 1; }
 
-          echo "::group::Pick FreeRDP package"
           RDP_PKG=""
           for pkg in freerdp3-x11 freerdp2-x11 freerdp-x11; do
             if apt-cache pkgnames "$pkg" 2>/dev/null | grep -qx "$pkg"; then
@@ -119,18 +110,15 @@ jobs:
             fi
           done
           if [ -z "$RDP_PKG" ]; then
-            echo "::error::No FreeRDP X11 package available on this runner image"
+            echo "::error::No FreeRDP X11 package available"
             apt-cache search freerdp || true
             exit 1
           fi
           echo "Using package: $RDP_PKG"
           echo "RDP_PKG=$RDP_PKG" >> "$GITHUB_ENV"
-          echo "::endgroup::"
 
-          echo "::group::Install core packages (kill + retry)"
           ok=0
           for i in $(seq 1 "$APT_MAX_ATTEMPTS"); do
-            echo "--- install attempt $i/$APT_MAX_ATTEMPTS"
             if apt_get "$APT_INSTALL_TIMEOUT" install -y --no-install-recommends \
                  "$RDP_PKG" tailscale xvfb ; then
               ok=1; break
@@ -138,12 +126,10 @@ jobs:
             recover_apt
           done
           if [ "$ok" -ne 1 ]; then
-            echo "::error::Core package install failed after $APT_MAX_ATTEMPTS attempts"
+            echo "::error::Core package install failed"
             exit 1
           fi
-          echo "::endgroup::"
 
-          echo "::group::Optional audio stack (best effort)"
           AUDIO_OK=0
           for i in 1 2 3; do
             if apt_get "$APT_INSTALL_TIMEOUT" install -y --no-install-recommends \
@@ -153,26 +139,20 @@ jobs:
             recover_apt
           done
           echo "AUDIO_OK=$AUDIO_OK" >> "$GITHUB_ENV"
-          [ "$AUDIO_OK" -eq 1 ] || echo "::warning::Audio unavailable — continuing silently"
-          echo "::endgroup::"
+          [ "$AUDIO_OK" -eq 1 ] || echo "::warning::Audio unavailable"
 
-          echo "::group::Detect xfreerdp binary"
           BIN=""
           for b in xfreerdp3 xfreerdp; do
             command -v "$b" >/dev/null 2>&1 && { BIN="$b"; break; }
           done
           if [ -z "$BIN" ]; then
-            echo "::error::xfreerdp binary missing after install"
+            echo "::error::xfreerdp binary missing"
             dpkg -L "$RDP_PKG" || true
             exit 1
           fi
           echo "XFREERDP_BIN=$BIN" >> "$GITHUB_ENV"
           "$BIN" /version || true
-          echo "::endgroup::"
 
-      # ---------------------------------------------------------------- #
-      # 2. Tailscale auth with retries (no hard fail on first try)       #
-      # ---------------------------------------------------------------- #
       - name: Authenticate Tailscale
         timeout-minutes: 5
         run: |
@@ -185,18 +165,18 @@ jobs:
                                  --accept-routes --timeout=60s ; then
               ok=1; break
             fi
-            echo "::warning::tailscale up attempt $i failed — resetting and retrying"
+            echo "::warning::tailscale up attempt $i failed"
             sudo tailscale down >/dev/null 2>&1 || true
             sleep $((i * 5))
           done
           if [ "$ok" -ne 1 ]; then
-            echo "::error::Tailscale auth failed — key likely expired / revoked / single-use already consumed"
+            echo "::error::Tailscale auth failed"
             sudo tailscale status || true
             exit 1
           fi
           sudo tailscale status || true
 
-      - name: Resolve IP & credentials
+      - name: Resolve IP and credentials
         env:
           DISPATCH_IP:   ${{ github.event.client_payload.ip }}
           DISPATCH_USER: ${{ github.event.client_payload.username }}
@@ -225,25 +205,21 @@ jobs:
       - name: Check target reachability
         run: |
           set -uo pipefail
-          echo "::group::Tailscale ping"
           for i in 1 2 3; do
             sudo tailscale ping -c 2 --timeout=5s "$TARGET_IP" && break
             sleep 3
-          done || echo "::warning::tailscale ping failed (device may block ICMP)"
-          echo "::endgroup::"
+          done || echo "::warning::tailscale ping failed"
 
-          echo "::group::TCP 3389 check"
           tcp_ok=0
           for i in 1 2 3; do
             if timeout 10 bash -c "</dev/tcp/${TARGET_IP}/3389" 2>/dev/null; then tcp_ok=1; break; fi
             sleep 5
           done
-          echo "::endgroup::"
           if [ "$tcp_ok" -eq 0 ]; then
-            echo "::warning::TCP 3389 not reachable yet — xfreerdp will retry on its own"
+            echo "::warning::TCP 3389 not reachable yet"
           fi
 
-      - name: Run persistent RDP session (auto stop / re-run)
+      - name: Run persistent RDP session
         timeout-minutes: 225
         run: |
           set -uo pipefail
@@ -251,110 +227,73 @@ jobs:
           XVFB_PID=""; RDP_PID=""
 
           cleanup() {
-            echo "::group::Cleanup"
-            [ -n "$RDP_PID" ]  && kill -9 "$RDP_PID"  2>/dev/null || true
+            [ -n "$RDP_PID" ] && kill -9 "$RDP_PID" 2>/dev/null || true
             [ -n "$XVFB_PID" ] && kill -9 "$XVFB_PID" 2>/dev/null || true
             command -v pulseaudio >/dev/null 2>&1 && pulseaudio -k 2>/dev/null || true
             sudo tailscale down 2>/dev/null || true
-            echo "::endgroup::"
           }
           trap cleanup EXIT INT TERM
 
-          # --- virtual X server (restart if it dies) ---
           Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
           XVFB_PID=$!
           export DISPLAY=:99
           sleep 2
           kill -0 "$XVFB_PID" 2>/dev/null || { echo "::error::Xvfb failed to start"; exit 1; }
 
-          # --- optional audio ---
           SOUND_ARGS=()
           if [ "${AUDIO_OK:-0}" = "1" ] && pulseaudio --start --exit-idle-time=-1 2>/dev/null; then
             SOUND_ARGS=(/sound:sys:pulse)
           fi
 
-          attempt=0
-          while [ "$attempt" -lt "$RDP_MAX_ATTEMPTS" ]; do
-            attempt=$((attempt + 1))
-            echo "::group::xfreerdp attempt $attempt/$RDP_MAX_ATTEMPTS -> $TARGET_IP"
+          "$XFREERDP_BIN" /v:"$TARGET_IP" \
+                         /u:"$TARGET_USER" \
+                         /p:"$TARGET_PASS" \
+                         /size:1920x1080 \
+                         /cert:ignore \
+                         /gfx \
+                         /network:auto \
+                         /log-level:WARN \
+                         "${SOUND_ARGS[@]}" &
+          RDP_PID=$!
+          echo "xfreerdp PID: $RDP_PID"
 
-            "$XFREERDP_BIN" /v:"$TARGET_IP" \
-                           /u:"$TARGET_USER" \
-                           /p:"$TARGET_PASS" \
-                           /size:1920x1080 \
-                           /cert:ignore \
-                           /gfx \
-                           /network:auto \
-                           /log-level:WARN \
-                           "${SOUND_ARGS[@]}" &
-            RDP_PID=$!
-            echo "xfreerdp PID: $RDP_PID"
-            echo "::endgroup::"
-
-            # ---- connection watchdog: wait for ESTABLISHED :3389 ----
-            connected=0
-            elapsed=0
-            while [ "$elapsed" -lt "$RDP_CONNECT_TIMEOUT" ]; do
-              if ! kill -0 "$RDP_PID" 2>/dev/null; then break; fi
-              if ss -tnp 2>/dev/null | grep -Eq "ESTAB.*:3389"; then
-                connected=1; break
-              fi
-              sleep 3
-              elapsed=$((elapsed + 3))
-            done
-
-            if [ "$connected" -eq 0 ]; then
-              echo "::warning::No RDP session established within ${RDP_CONNECT_TIMEOUT}s — killing & retrying"
-              kill -9 "$RDP_PID" 2>/dev/null || true
-              wait "$RDP_PID" 2>/dev/null || true
-              if [ "${#SOUND_ARGS[@]}" -gt 0 ]; then
-                echo "::warning::Disabling sound for next attempt"
-                SOUND_ARGS=()
-              fi
-              sleep $((attempt * 5))
-              continue
+          connected=0
+          elapsed=0
+          while [ "$elapsed" -lt "$RDP_CONNECT_TIMEOUT" ]; do
+            if ! kill -0 "$RDP_PID" 2>/dev/null; then break; fi
+            if ss -tnp 2>/dev/null | grep -Eq "ESTAB.*:3389"; then
+              connected=1; break
             fi
-
-            echo "RDP session established on attempt $attempt"
-
-            # ---- health monitor while the session lives ----
-            while kill -0 "$RDP_PID" 2>/dev/null; do
-              if ! sudo tailscale status >/dev/null 2>&1; then
-                echo "::warning::Tailscale unhealthy — re-authing"
-                sudo tailscale up --authkey="$TS_AUTHKEY" \
-                                  --hostname="rdp-bridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}" \
-                                  --accept-routes --timeout=60s || true
-              fi
-              if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-                echo "::warning::Xvfb died — restarting"
-                Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
-                XVFB_PID=$!
-              fi
-              echo "[$(date -u +%H:%M:%S)] Bridge alive on $TARGET_IP (pid $RDP_PID, attempt $attempt)"
-              sleep 15
-            done
-
-            wait "$RDP_PID"; rc=$?
-            echo "xfreerdp exited rc=$rc on attempt $attempt"
-
-            [ "$rc" -eq 0 ] && { echo "Session closed cleanly by remote side."; exit 0; }
-
-            # bad creds / bad flags → try once without sound, otherwise keep retrying
-            if [ "$rc" -eq 1 ] || [ "$rc" -eq 131 ]; then
-              if [ "${#SOUND_ARGS[@]}" -gt 0 ]; then
-                echo "::warning::Auth/connection error — retrying once without audio redirection"
-                SOUND_ARGS=()
-                attempt=$((attempt - 1))
-                continue
-              fi
-              echo "::warning::Auth/connection error with sound disabled too — retrying in case of transient issue"
-            fi
-
-            sleep $((attempt * 5))
+            sleep 3
+            elapsed=$((elapsed + 3))
           done
 
-          echo "::error::RDP session could not be maintained after $RDP_MAX_ATTEMPTS attempts"
-          exit 1
+          if [ "$connected" -eq 0 ]; then
+            echo "::warning::No RDP session within ${RDP_CONNECT_TIMEOUT}s - ending job"
+            kill -9 "$RDP_PID" 2>/dev/null || true
+            wait "$RDP_PID" 2>/dev/null || true
+            exit 0
+          fi
+
+          echo "RDP session established to $TARGET_IP"
+
+          while kill -0 "$RDP_PID" 2>/dev/null; do
+            if ! sudo tailscale status >/dev/null 2>&1; then
+              sudo tailscale up --authkey="$TS_AUTHKEY" \
+                                --hostname="rdp-bridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}" \
+                                --accept-routes --timeout=60s || true
+            fi
+            if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+              Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+              XVFB_PID=$!
+            fi
+            echo "[$(date -u +%H:%M:%S)] Bridge alive on $TARGET_IP (pid $RDP_PID)"
+            sleep 15
+          done
+
+          wait "$RDP_PID" 2>/dev/null || true
+          echo "RDP session ended - target disconnected or closed. Finishing job cleanly."
+          exit 0
 
       - name: Diagnostics on failure
         if: failure()
