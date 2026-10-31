@@ -15,48 +15,14 @@ on:
         description: 'Target Windows Password'
         required: false
 
-concurrency:
-  group: rdp-bridge-${{ github.event.client_payload.ip || inputs.ip || github.run_id }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
 jobs:
   RDP:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
-    env:
-      DEBIAN_FRONTEND: noninteractive
-      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      APT_UPDATE_TIMEOUT: 300
-      APT_INSTALL_TIMEOUT: 480
-      APT_MAX_ATTEMPTS: 5
+    timeout-minutes: 250
 
     steps:
-      - name: Preflight validation
-        env:
-          DISPATCH_IP: ${{ github.event.client_payload.ip }}
-          INPUT_IP: ${{ inputs.ip }}
-        run: |
-          set -euo pipefail
-          fail=0
-
-          if [ -z "${TS_AUTHKEY:-}" ]; then
-            echo "::error::Secret TAILSCALE_AUTH_KEY is missing"; fail=1
-          fi
-
-          IP="${DISPATCH_IP:-${INPUT_IP:-}}"
-          if [ -z "$IP" ]; then
-            echo "::error::No target IP supplied"; fail=1
-          fi
-
-          echo "Runner: $(lsb_release -ds 2>/dev/null || head -1 /etc/os-release)"
-          [ "$fail" -eq 1 ] && exit 1
-          echo "Preflight OK -> $IP"
-
-      - name: Install dependencies
-        timeout-minutes: 60
+      - name: Add Tailscale Repository & Install Dependencies
+        timeout-minutes: 30
         run: |
           set -uo pipefail
 
@@ -82,6 +48,8 @@ jobs:
             sleep 5
           }
 
+          # 1. Add Tailscale GPG Key & Repo
+          repo_ok=0
           for i in 1 2 3; do
             if curl -fsSL --retry 3 --retry-delay 2 --max-time 60 \
                  https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
@@ -89,19 +57,29 @@ jobs:
                && curl -fsSL --retry 3 --retry-delay 2 --max-time 60 \
                  https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
                  | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null ; then
-              break
+              repo_ok=1; break
             fi
             echo "::warning::Repo setup attempt $i failed"
             sleep 5
           done
+          if [ "$repo_ok" -ne 1 ]; then
+            echo "::error::Failed to add Tailscale repo after 3 attempts"
+            exit 1
+          fi
 
-          ok=0
-          for i in $(seq 1 "$APT_MAX_ATTEMPTS"); do
-            if apt_get "$APT_UPDATE_TIMEOUT" update; then ok=1; break; fi
+          # 2. apt-get update with kill + retry
+          update_ok=0
+          for i in 1 2 3 4 5; do
+            echo "--- apt-get update attempt $i/5"
+            if apt_get 300 update; then update_ok=1; break; fi
             recover_apt
           done
-          [ "$ok" -eq 1 ] || { echo "::error::apt-get update failed"; exit 1; }
+          if [ "$update_ok" -ne 1 ]; then
+            echo "::error::apt-get update failed after 5 attempts"
+            exit 1
+          fi
 
+          # 3. Pick an available FreeRDP package (freerdp2-x11 no longer exists on newer runners)
           RDP_PKG=""
           for pkg in freerdp3-x11 freerdp2-x11 freerdp-x11; do
             if apt-cache pkgnames "$pkg" 2>/dev/null | grep -qx "$pkg"; then
@@ -113,39 +91,42 @@ jobs:
             apt-cache search freerdp || true
             exit 1
           fi
-          echo "Using package: $RDP_PKG"
+          echo "Using FreeRDP package: $RDP_PKG"
 
-          ok=0
-          for i in $(seq 1 "$APT_MAX_ATTEMPTS"); do
-            if apt_get "$APT_INSTALL_TIMEOUT" install -y --no-install-recommends \
+          # 4. Install core packages with kill + retry
+          core_ok=0
+          for i in 1 2 3 4 5; do
+            echo "--- core install attempt $i/5"
+            if apt_get 480 install -y --no-install-recommends \
                  "$RDP_PKG" tailscale xvfb ; then
-              ok=1; break
+              core_ok=1; break
             fi
             recover_apt
           done
-          if [ "$ok" -ne 1 ]; then
-            echo "::error::Core package install failed"
+          if [ "$core_ok" -ne 1 ]; then
+            echo "::error::Core package install failed after 5 attempts"
             exit 1
           fi
 
-          AUDIO_OK=0
+          # 5. Optional audio (best effort)
+          audio_ok=0
           for i in 1 2 3; do
-            if apt_get "$APT_INSTALL_TIMEOUT" install -y --no-install-recommends \
+            if apt_get 480 install -y --no-install-recommends \
                  pulseaudio alsa-utils libasound2-plugins ; then
-              AUDIO_OK=1; break
+              audio_ok=1; break
             fi
             recover_apt
           done
-          echo "AUDIO_OK=$AUDIO_OK" >> "$GITHUB_ENV"
-          [ "$AUDIO_OK" -eq 1 ] || echo "::warning::Audio unavailable"
+          [ "$audio_ok" -eq 1 ] || echo "::warning::Audio stack unavailable - continuing without sound"
 
+          # 6. Ensure an 'xfreerdp' command exists even if only xfreerdp3/xfreerdp2 is shipped
           if ! command -v xfreerdp >/dev/null 2>&1; then
             if command -v xfreerdp3 >/dev/null 2>&1; then
               sudo ln -sf "$(command -v xfreerdp3)" /usr/local/bin/xfreerdp
-              echo "::notice::xfreerdp not shipped - linked xfreerdp3 -> xfreerdp"
+              echo "::notice::Linked xfreerdp3 -> xfreerdp"
             elif command -v xfreerdp2 >/dev/null 2>&1; then
               sudo ln -sf "$(command -v xfreerdp2)" /usr/local/bin/xfreerdp
-              echo "::notice::xfreerdp not shipped - linked xfreerdp2 -> xfreerdp"
+              echo "::notice::Linked xfreerdp2 -> xfreerdp"
             else
               echo "::error::No xfreerdp binary after install"
               dpkg -L "$RDP_PKG" || true
@@ -155,27 +136,12 @@ jobs:
           xfreerdp /version || true
 
       - name: Authenticate Tailscale
-        timeout-minutes: 5
         run: |
-          set -uo pipefail
-          HOST="rdp-bridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
-          ok=0
-          for i in 1 2 3 4; do
-            if sudo tailscale up --authkey="$TS_AUTHKEY" \
-                                 --hostname="$HOST" \
-                                 --accept-routes --timeout=60s ; then
-              ok=1; break
-            fi
-            echo "::warning::tailscale up attempt $i failed"
-            sudo tailscale down >/dev/null 2>&1 || true
-            sleep $((i * 5))
-          done
-          if [ "$ok" -ne 1 ]; then
-            echo "::error::Tailscale auth failed"
-            sudo tailscale status || true
-            exit 1
-          fi
-          sudo tailscale status || true
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+                            --hostname=rdp-bridge-${{ github.run_id }} \
+                            --accept-routes
+          sleep 3
+          tailscale status || true
 
       - name: Resolve IP & Credentials
         run: |
