@@ -32,7 +32,6 @@ jobs:
       APT_UPDATE_TIMEOUT: 300
       APT_INSTALL_TIMEOUT: 480
       APT_MAX_ATTEMPTS: 5
-      RDP_CONNECT_TIMEOUT: 60
 
     steps:
       - name: Preflight validation
@@ -115,7 +114,6 @@ jobs:
             exit 1
           fi
           echo "Using package: $RDP_PKG"
-          echo "RDP_PKG=$RDP_PKG" >> "$GITHUB_ENV"
 
           ok=0
           for i in $(seq 1 "$APT_MAX_ATTEMPTS"); do
@@ -141,17 +139,20 @@ jobs:
           echo "AUDIO_OK=$AUDIO_OK" >> "$GITHUB_ENV"
           [ "$AUDIO_OK" -eq 1 ] || echo "::warning::Audio unavailable"
 
-          BIN=""
-          for b in xfreerdp3 xfreerdp; do
-            command -v "$b" >/dev/null 2>&1 && { BIN="$b"; break; }
-          done
-          if [ -z "$BIN" ]; then
-            echo "::error::xfreerdp binary missing"
-            dpkg -L "$RDP_PKG" || true
-            exit 1
+          if ! command -v xfreerdp >/dev/null 2>&1; then
+            if command -v xfreerdp3 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v xfreerdp3)" /usr/local/bin/xfreerdp
+              echo "::notice::xfreerdp not shipped - linked xfreerdp3 -> xfreerdp"
+            elif command -v xfreerdp2 >/dev/null 2>&1; then
+              sudo ln -sf "$(command -v xfreerdp2)" /usr/local/bin/xfreerdp
+              echo "::notice::xfreerdp not shipped - linked xfreerdp2 -> xfreerdp"
+            else
+              echo "::error::No xfreerdp binary after install"
+              dpkg -L "$RDP_PKG" || true
+              exit 1
+            fi
           fi
-          echo "XFREERDP_BIN=$BIN" >> "$GITHUB_ENV"
-          "$BIN" /version || true
+          xfreerdp /version || true
 
       - name: Authenticate Tailscale
         timeout-minutes: 5
@@ -176,124 +177,62 @@ jobs:
           fi
           sudo tailscale status || true
 
-      - name: Resolve IP and credentials
-        env:
-          DISPATCH_IP:   ${{ github.event.client_payload.ip }}
-          DISPATCH_USER: ${{ github.event.client_payload.username }}
-          DISPATCH_PASS: ${{ github.event.client_payload.password }}
-          INPUT_IP:      ${{ inputs.ip }}
-          INPUT_USER:    ${{ inputs.username }}
-          INPUT_PASS:    ${{ inputs.password }}
-          SECRET_USER:   ${{ secrets.RDP_USER }}
-          SECRET_PASS:   ${{ secrets.RDP_PASSWORD }}
+      - name: Resolve IP & Credentials
         run: |
-          set -euo pipefail
-          TARGET_IP="${DISPATCH_IP:-${INPUT_IP:-}}"
-          TARGET_USER="${DISPATCH_USER:-${INPUT_USER:-${SECRET_USER:-Cloud PC}}}"
-          TARGET_PASS="${DISPATCH_PASS:-${INPUT_PASS:-${SECRET_PASS:-123456}}}"
-          [ -n "$TARGET_IP" ] || { echo "::error::TARGET_IP is empty"; exit 1; }
+          TARGET_IP="${{ github.event.client_payload.ip || inputs.ip }}"
+          TARGET_USER="${{ github.event.client_payload.username || inputs.username || secrets.RDP_USER || 'Cloud PC' }}"
+          TARGET_PASS="${{ github.event.client_payload.password || inputs.password || secrets.RDP_PASSWORD || '123456' }}"
 
-          { echo "TARGET_IP=$TARGET_IP"
-            echo "TARGET_USER=$TARGET_USER"
-            echo "TARGET_PASS=$TARGET_PASS"
-          } >> "$GITHUB_ENV"
+          if [ -z "$TARGET_IP" ]; then
+            echo "::error::TARGET_IP is empty"
+            exit 1
+          fi
+
+          echo "TARGET_IP=$TARGET_IP"     >> $GITHUB_ENV
+          echo "TARGET_USER=$TARGET_USER" >> $GITHUB_ENV
+          echo "TARGET_PASS=$TARGET_PASS" >> $GITHUB_ENV
 
           echo "::add-mask::$TARGET_PASS"
           echo "::add-mask::$TARGET_USER"
           echo "Resolved target: $TARGET_IP"
 
-      - name: Check target reachability
+      - name: Run Persistent RDP Session inside XVFB
         run: |
-          set -uo pipefail
-          for i in 1 2 3; do
-            sudo tailscale ping -c 2 --timeout=5s "$TARGET_IP" && break
-            sleep 3
-          done || echo "::warning::tailscale ping failed"
+          echo "Connecting headless RDP session to $TARGET_IP..."
 
-          tcp_ok=0
-          for i in 1 2 3; do
-            if timeout 10 bash -c "</dev/tcp/${TARGET_IP}/3389" 2>/dev/null; then tcp_ok=1; break; fi
-            sleep 5
-          done
-          if [ "$tcp_ok" -eq 0 ]; then
-            echo "::warning::TCP 3389 not reachable yet"
-          fi
-
-      - name: Run persistent RDP session
-        timeout-minutes: 225
-        run: |
-          set -uo pipefail
-
-          XVFB_PID=""; RDP_PID=""
-
-          cleanup() {
-            [ -n "$RDP_PID" ] && kill -9 "$RDP_PID" 2>/dev/null || true
-            [ -n "$XVFB_PID" ] && kill -9 "$XVFB_PID" 2>/dev/null || true
-            command -v pulseaudio >/dev/null 2>&1 && pulseaudio -k 2>/dev/null || true
-            sudo tailscale down 2>/dev/null || true
-          }
-          trap cleanup EXIT INT TERM
-
-          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
-          XVFB_PID=$!
+          # 1. Start Virtual X Server
+          Xvfb :99 -screen 0 1920x1080x24 &
           export DISPLAY=:99
           sleep 2
-          kill -0 "$XVFB_PID" 2>/dev/null || { echo "::error::Xvfb failed to start"; exit 1; }
 
-          SOUND_ARGS=()
-          if [ "${AUDIO_OK:-0}" = "1" ] && pulseaudio --start --exit-idle-time=-1 2>/dev/null; then
-            SOUND_ARGS=(/sound:sys:pulse)
-          fi
+          # 2. Start Virtual PulseAudio Daemon for Sound Handling
+          pulseaudio --start --exit-idle-time=-1
+          sleep 1
 
-          "$XFREERDP_BIN" /v:"$TARGET_IP" \
-                         /u:"$TARGET_USER" \
-                         /p:"$TARGET_PASS" \
-                         /size:1920x1080 \
-                         /cert:ignore \
-                         /gfx \
-                         /network:auto \
-                         /log-level:WARN \
-                         "${SOUND_ARGS[@]}" &
+          # 3. Launch FreeRDP session with sound redirection
+          xfreerdp /v:"$TARGET_IP" \
+                   /u:"$TARGET_USER" \
+                   /p:"$TARGET_PASS" \
+                   /size:1920x1080 \
+                   /cert-ignore \
+                   /cert:ignore \
+                   /gfx \
+                   /network:auto \
+                   /sound:sys:pulse &
+
           RDP_PID=$!
-          echo "xfreerdp PID: $RDP_PID"
+          echo "RDP Client running under PID: $RDP_PID"
 
-          connected=0
-          elapsed=0
-          while [ "$elapsed" -lt "$RDP_CONNECT_TIMEOUT" ]; do
-            if ! kill -0 "$RDP_PID" 2>/dev/null; then break; fi
-            if ss -tnp 2>/dev/null | grep -Eq "ESTAB.*:3389"; then
-              connected=1; break
-            fi
-            sleep 3
-            elapsed=$((elapsed + 3))
-          done
+          # Give process a moment to establish connection
+          sleep 5
 
-          if [ "$connected" -eq 0 ]; then
-            echo "::warning::No RDP session within ${RDP_CONNECT_TIMEOUT}s - ending job"
-            kill -9 "$RDP_PID" 2>/dev/null || true
-            wait "$RDP_PID" 2>/dev/null || true
-            exit 0
-          fi
-
-          echo "RDP session established to $TARGET_IP"
-
-          while kill -0 "$RDP_PID" 2>/dev/null; do
-            if ! sudo tailscale status >/dev/null 2>&1; then
-              sudo tailscale up --authkey="$TS_AUTHKEY" \
-                                --hostname="rdp-bridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}" \
-                                --accept-routes --timeout=60s || true
-            fi
-            if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-              Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
-              XVFB_PID=$!
-            fi
-            echo "[$(date -u +%H:%M:%S)] Bridge alive on $TARGET_IP (pid $RDP_PID)"
+          # 4. Monitor loop: Keep active as long as RDP session remains alive
+          while kill -0 $RDP_PID 2>/dev/null; do
+            echo "[$(date)] Linux Bridge actively maintaining GUI & Audio session on $TARGET_IP..."
             sleep 15
           done
 
-          wait "$RDP_PID" 2>/dev/null || true
-          echo "RDP session ended - target disconnected or closed. Finishing job cleanly."
-          exit 0
+          echo "RDP connection closed or overridden. Terminating action cleanly."
 
       - name: Diagnostics on failure
         if: failure()
